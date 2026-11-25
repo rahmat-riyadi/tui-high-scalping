@@ -1,0 +1,16 @@
+[package]
+name = "tui-market-making"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+binance-sdk = { version = "77.0.0", features = ["derivatives_trading_usds_futures"]}
+crossterm = "0.29.0"
+ratatui = "0.30.2"
+reqwest = {version = "0.13.5", features = ["json"]}
+serde = { version = "1.0.229", features = ["derive"] }
+tokio = { version = "1.54.0", features = ["full"]}
+tokio-tungstenite = "0.30.0"
+anyhow = "1.0"
+rand = "0.9"
+rust_decimal = "1.36"

@@ -1,0 +1,368 @@
+use std::time::Duration;
+
+use ratatui::{
+    Frame,
+    crossterm::event::{self, Event, KeyCode, KeyEventKind},
+    layout::{Constraint, Layout, Rect},
+    style::{Color, Modifier, Style, Stylize},
+    text::{Line, Span},
+    widgets::{Block, Cell, Paragraph, Row, Table},
+};
+
+const TICK: Duration = Duration::from_millis(33); 
+const BAR_WIDTH: usize = 8;
+const IMBALANCE_HALF: usize = 10;
+const LADDER_WIDTHS: [Constraint; 5] = [
+    Constraint::Length(6),  // bps
+    Constraint::Length(9),  // price
+    Constraint::Length(8),  // size
+    Constraint::Length(7),  // cum
+    Constraint::Fill(1),    // depth bar
+];
+
+// ───────────────────────── Data ─────────────────────────
+
+struct Level {
+    price: f64,
+    size: f64,
+}
+
+struct AppState {
+    symbol: &'static str,
+    tick_size: f64,
+    asks: Vec<Level>,
+    bids: Vec<Level>,
+}
+
+impl AppState {
+    fn mock() -> Self {
+        let ask_sizes = [82.0, 310.5, 145.2, 520.0, 95.8, 240.3, 410.0, 175.5, 330.0, 120.0, 260.0, 90.0];
+        let bid_sizes = [120.5, 260.0, 88.4, 610.2, 150.0, 305.7, 198.0, 430.4, 75.0, 280.0, 140.0, 360.0];
+        let asks = ask_sizes
+            .iter()
+            .enumerate()
+            .map(|(i, &size)| Level { price: 168.41 + 0.01 * i as f64, size })
+            .collect();
+        let bids = bid_sizes
+            .iter()
+            .enumerate()
+            .map(|(i, &size)| Level { price: 168.39 - 0.01 * i as f64, size })
+            .collect();
+        Self { symbol: "SOLUSDT", tick_size: 0.01, asks, bids }
+    }
+
+    fn best_bid(&self) -> Option<&Level> {
+        self.bids.first()
+    }
+
+    fn best_ask(&self) -> Option<&Level> {
+        self.asks.first()
+    }
+
+    fn mid(&self) -> Option<f64> {
+        Some((self.best_bid()?.price + self.best_ask()?.price) / 2.0)
+    }
+
+    fn spread(&self) -> Option<f64> {
+        Some(self.best_ask()?.price - self.best_bid()?.price)
+    }
+
+    fn microprice(&self) -> Option<f64> {
+        let (b, a) = (self.best_bid()?, self.best_ask()?);
+        Some((b.price * a.size + a.price * b.size) / (a.size + b.size))
+    }
+
+    fn imbalance(&self, n: usize) -> Option<f64> {
+        let bid: f64 = self.bids.iter().take(n).map(|l| l.size).sum();
+        let ask: f64 = self.asks.iter().take(n).map(|l| l.size).sum();
+        let total = bid + ask;
+        (total > 0.0).then(|| (bid - ask) / total)
+    }
+
+    fn max_size(&self) -> f64 {
+        self.asks.iter().chain(&self.bids).map(|l| l.size).fold(0.0, f64::max)
+    }
+}
+
+// ───────────────────────── Layout ─────────────────────────
+
+struct Areas {
+    header: Rect,
+    ladder: Rect,
+    quote: Rect,
+    spread: Rect,
+    imbalance: Rect,
+    status: Rect,
+    footer: Rect,
+}
+
+/// Satu-satunya tempat ukuran panel diatur.
+fn compute_areas(area: Rect) -> Areas {
+    use Constraint::{Fill, Length, Percentage};
+
+    let [header, body, status, footer] =
+        Layout::vertical([Length(3), Fill(1), Length(4), Length(3)]).areas(area);
+
+    let [ladder, right] = Layout::horizontal([Percentage(45), Percentage(55)]).areas(body);
+
+    let [quote, spread, imbalance] =
+        Layout::vertical([Length(5), Length(5), Fill(1)]).areas(right);
+
+    Areas { header, ladder, quote, spread, imbalance, status, footer }
+}
+
+// ───────────────────────── Main ─────────────────────────
+
+fn main() -> std::io::Result<()> {
+    let state = AppState::mock();
+
+    ratatui::run(|terminal| {
+        loop {
+            terminal.draw(|frame| render(frame, &state))?;
+
+            // Tunggu event maksimal 1 tick, lalu gambar ulang (cocok untuk data live).
+            if event::poll(TICK)? {
+                if let Event::Key(key) = event::read()? {
+                    if key.kind == KeyEventKind::Press
+                        && matches!(key.code, KeyCode::Esc | KeyCode::Char('q'))
+                    {
+                        break Ok(());
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn render(frame: &mut Frame, state: &AppState) {
+    let a = compute_areas(frame.area());
+
+    render_header(frame, a.header, state);
+    render_ladder(frame, a.ladder, state);
+    render_quote(frame, a.quote, state);
+    render_spread(frame, a.spread, state);
+    render_imbalance(frame, a.imbalance, state);
+    render_status(frame, a.status);
+    render_footer(frame, a.footer);
+}
+
+// ───────────────────────── Helpers ─────────────────────────
+
+fn panel(title: &str) -> Block<'static> {
+    Block::bordered().title(format!(" {title} "))
+}
+
+fn num_cell(text: impl Into<String>) -> Cell<'static> {
+    Cell::from(Line::from(text.into()).right_aligned())
+}
+
+fn shortcuts(items: &[(&str, &str)]) -> Line<'static> {
+    let mut spans = Vec::new();
+    for (i, (key, label)) in items.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("   "));
+        }
+        spans.push(Span::styled(key.to_string(), Style::new().bold().fg(Color::Yellow)));
+        spans.push(Span::styled(format!(" {label}"), Style::new().dim()));
+    }
+    Line::from(spans)
+}
+
+// ───────────────────────── Panels ─────────────────────────
+
+fn render_header(frame: &mut Frame, area: Rect, state: &AppState) {
+    let block = Block::bordered();
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let [left, right] =
+        Layout::horizontal([Constraint::Fill(1), Constraint::Fill(1)]).areas(inner);
+
+    frame.render_widget(Paragraph::new(state.symbol.bold()), left);
+    frame.render_widget(Paragraph::new("● LIVE".green()).right_aligned(), right);
+}
+
+fn render_ladder(frame: &mut Frame, area: Rect, state: &AppState) {
+    use Constraint::{Fill, Length};
+
+    let block = panel("Order Book");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let [head, asks_area, spread_area, bids_area] =
+        Layout::vertical([Length(1), Fill(1), Length(1), Fill(1)]).areas(inner);
+
+    let (Some(mid), Some(spread)) = (state.mid(), state.spread()) else {
+        return;
+    };
+    let max_size = state.max_size();
+
+    // Header kolom
+    let header = Row::new([
+        num_cell("BPS"),
+        num_cell("PRICE"),
+        num_cell("SIZE"),
+        num_cell("CUM"),
+        Cell::from("DEPTH"),
+    ])
+    .style(Style::new().add_modifier(Modifier::BOLD | Modifier::DIM));
+    frame.render_widget(Table::new(Vec::<Row>::new(), LADDER_WIDTHS).header(header), head);
+
+    // Ask: terjauh di atas, terdekat menempel ke baris spread
+    let mut ask_rows = side_rows(&state.asks, asks_area.height as usize, mid, max_size, Color::Red);
+    ask_rows.reverse();
+    frame.render_widget(Table::new(ask_rows, LADDER_WIDTHS), asks_area);
+
+    // Baris spread di tengah
+    let spread_text = format!(
+        "spread {:.2} · {:.0} ticks · {:.2} bps",
+        spread,
+        spread / state.tick_size,
+        spread / mid * 10_000.0
+    );
+    frame.render_widget(Paragraph::new(spread_text.dim()).centered(), spread_area);
+
+    // Bid: terdekat di atas, terjauh di bawah
+    let bid_rows = side_rows(&state.bids, bids_area.height as usize, mid, max_size, Color::Green);
+    frame.render_widget(Table::new(bid_rows, LADDER_WIDTHS), bids_area);
+}
+
+/// Baris ladder untuk satu sisi, urutan terbaik -> terjauh, dengan CUM dihitung dari touch.
+fn side_rows(levels: &[Level], n: usize, mid: f64, max_size: f64, color: Color) -> Vec<Row<'static>> {
+    let mut cum = 0.0;
+    levels
+        .iter()
+        .take(n)
+        .map(|l| {
+            cum += l.size;
+            let bps = (l.price - mid) / mid * 10_000.0;
+            let bar = "█".repeat((l.size / max_size * BAR_WIDTH as f64).round() as usize);
+            Row::new([
+                num_cell(format!("{bps:+.1}")),
+                num_cell(format!("{:.2}", l.price)),
+                num_cell(format!("{:.1}", l.size)),
+                num_cell(format!("{cum:.0}")),
+                Cell::from(bar),
+            ])
+            .style(Style::new().fg(color))
+        })
+        .collect()
+}
+
+fn render_quote(frame: &mut Frame, area: Rect, state: &AppState) {
+    let block = panel("Quote");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let (Some(bid), Some(ask), Some(mid), Some(spread), Some(micro)) = (
+        state.best_bid(),
+        state.best_ask(),
+        state.mid(),
+        state.spread(),
+        state.microprice(),
+    ) else {
+        return;
+    };
+
+    let lines = vec![
+        Line::from(vec![
+            "Bid ".dim(),
+            format!("{:.2} × {:.1}", bid.price, bid.size).green().bold(),
+            "    Ask ".dim(),
+            format!("{:.2} × {:.1}", ask.price, ask.size).red().bold(),
+        ]),
+        Line::from(vec![
+            "Mid ".dim(),
+            format!("{mid:.4}").bold(),
+            "   µPrice ".dim(),
+            format!("{micro:.4}").bold(),
+            format!(" ({:+.2} tick)", (micro - mid) / state.tick_size).dim(),
+        ]),
+        Line::from(vec![
+            "Spread ".dim(),
+            format!(
+                "{:.2} = {:.0} ticks = {:.2} bps",
+                spread,
+                spread / state.tick_size,
+                spread / mid * 10_000.0
+            )
+            .bold(),
+        ]),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn render_spread(frame: &mut Frame, area: Rect, state: &AppState) {
+    let block = panel("Spread");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let (Some(mid), Some(spread)) = (state.mid(), state.spread()) else {
+        return;
+    };
+    let lines = vec![
+        Line::from(vec![
+            "now ".dim(),
+            format!("{:.2} bps", spread / mid * 10_000.0).bold(),
+        ]),
+        Line::from("sparkline 5m + median/p90: menyusul".dim()),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn render_imbalance(frame: &mut Frame, area: Rect, state: &AppState) {
+    let block = panel("Imbalance");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let lines: Vec<Line> = [("top1", 1), ("top5", 5), ("top10", 10)]
+        .iter()
+        .filter_map(|&(label, n)| {
+            let v = state.imbalance(n)?;
+            let mut spans = vec![format!("{label:<6}").dim(), format!("{v:+.2}  ").bold()];
+            spans.extend(imbalance_bar(v));
+            Some(Line::from(spans))
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Bar dua arah dari tengah: kiri merah (ask-heavy), kanan hijau (bid-heavy).
+fn imbalance_bar(v: f64) -> Vec<Span<'static>> {
+    let n = ((v.abs() * IMBALANCE_HALF as f64).round() as usize).min(IMBALANCE_HALF);
+    let (left, right) = if v < 0.0 { (n, 0) } else { (0, n) };
+    vec![
+        "·".repeat(IMBALANCE_HALF - left).dim(),
+        "█".repeat(left).red(),
+        Span::raw("│"),
+        "█".repeat(right).green(),
+        "·".repeat(IMBALANCE_HALF - right).dim(),
+    ]
+}
+
+fn render_status(frame: &mut Frame, area: Rect) {
+    let block = panel("Status");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let lines = vec![
+        Line::from(vec![
+            "feed ".dim(),
+            "LIVE".green().bold(),
+            "   latency 12ms   42 upd/s".dim(),
+        ]),
+        Line::from(vec!["alerts ".dim(), "none".green()]),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn render_footer(frame: &mut Frame, area: Rect) {
+    let block = Block::bordered();
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    frame.render_widget(
+        Paragraph::new(shortcuts(&[("s", "switch"), ("esc", "quit")])),
+        inner,
+    );
+}
